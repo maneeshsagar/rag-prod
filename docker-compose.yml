@@ -1,0 +1,54 @@
+# Local infrastructure: Postgres, Redis, Qdrant (+ optional SeaweedFS for S3) run in Docker.
+# The Python backend and the Next.js frontend run directly on the Mac
+# and connect to these services on localhost.
+#
+#   make up     -> start everything
+#   make down   -> stop everything (data is kept in volumes)
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: rag
+      POSTGRES_PASSWORD: rag
+      POSTGRES_DB: rag
+    ports:
+      - "5433:5432"  # 5433 on the Mac: 5432 is used by another project
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rag"]
+      interval: 5s
+      retries: 10
+
+  redis:
+    image: redis:7.4-alpine
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  qdrant:
+    image: qdrant/qdrant:v1.20.0
+    ports:
+      - "6333:6333"   # HTTP API + web dashboard at http://localhost:6333/dashboard
+      - "6334:6334"   # gRPC
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+  # Optional S3-compatible storage (replaces MinIO, which stopped publishing images).
+  # Not started by `make up`; start it with `make s3-up` and set STORAGE_BACKEND=s3.
+  seaweedfs:
+    image: chrislusf/seaweedfs:3.85
+    profiles: ["s3"]
+    command: server -dir=/data -s3 -s3.port=8333
+    ports:
+      - "8333:8333"   # S3 API
+    volumes:
+      - seaweedfs_data:/data
+
+volumes:
+  postgres_data:
+  redis_data:
+  qdrant_data:
+  seaweedfs_data:
