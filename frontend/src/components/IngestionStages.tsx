@@ -1,12 +1,12 @@
 "use client";
 
 // Step-by-step progress of one document:
-// Uploaded → Parsing → Chunking → Embedding → Indexing → Summarizing → Done
+// Queued → Parsing → Chunking → Embedding → Indexing → Summarizing → Done
 
 import type { DocumentInfo } from "@/lib/types";
 
 const STAGES: { key: string; label: string }[] = [
-  { key: "store", label: "Uploaded" },
+  { key: "queued", label: "Queued" },
   { key: "parse", label: "Parsing" },
   { key: "chunk", label: "Chunking" },
   { key: "embed", label: "Embedding" },

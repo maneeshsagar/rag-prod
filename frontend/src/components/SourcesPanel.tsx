@@ -30,6 +30,7 @@ export default function SourcesPanel({ message, highlighted }: Props) {
             {c.citation_label}
             {c.section_path && ` · ${c.section_path}`}
           </div>
+          {c.version_note && <p className="warning small">⚠ {capitalize(c.version_note)}</p>}
           {c.quote && <blockquote>{c.quote}</blockquote>}
           {!c.supported && <p className="warning small">Check this citation: weak match with the source.</p>}
         </div>
@@ -40,4 +41,8 @@ export default function SourcesPanel({ message, highlighted }: Props) {
       )}
     </aside>
   );
+}
+
+function capitalize(text: string): string {
+  return text.charAt(0).toUpperCase() + text.slice(1);
 }

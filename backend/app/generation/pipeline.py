@@ -9,7 +9,8 @@ Events (each a dict with a "type"):
     route    {"route", "question"}            chosen route + standalone question
     sources  {"sources": [...]}               sources given to the model
     token    {"text"}                         a piece of the answer
-    done     {"answer", "citations", ...}     final answer + citation check
+    done     {"answer", "citations", "usage", ...}   final answer + citation check +
+                                                     tokens and cost of every AI call
 
 No database access here, so the chat API and the eval can both use it.
 """
@@ -19,7 +20,9 @@ import time
 from collections.abc import Iterator
 from dataclasses import replace
 
+from app.core import tracing
 from app.core.config import get_settings
+from app.core.usage import track_usage
 from app.generation.agent import agentic_retrieve
 from app.generation.citations import verify_citations
 from app.generation.prompts import (
@@ -55,11 +58,22 @@ def _drop_noise(sources: list[Source]) -> list[Source]:
 
 
 def answer_question(question: str, history: list[dict]) -> Iterator[dict]:
+    """Answer one question as a stream of events, counting tokens and cost on the way."""
+    with track_usage() as meter:
+        for event in _answer(question, history):
+            if event["type"] == "done":
+                event["usage"] = meter.summary()
+            yield event
+
+
+def _answer(question: str, history: list[dict]) -> Iterator[dict]:
     started = time.monotonic()
     llm = get_llm()
 
     yield {"type": "status", "message": "Understanding the question"}
-    decision = route_question(question, history)
+    with tracing.span("route", input=question) as step:
+        decision = route_question(question, history)
+        step.update(output=decision.model_dump())
     standalone = decision.standalone_question or question
     yield {"type": "route", "route": decision.route, "question": standalone}
 
@@ -77,17 +91,20 @@ def answer_question(question: str, history: list[dict]) -> Iterator[dict]:
         return
 
     sources: list[Source] = []
-    if decision.route == "agentic":
-        for item in agentic_retrieve(standalone):
-            if isinstance(item, dict):
-                yield {"type": "status", "message": item["status"]}
-            else:
-                sources = item
-    else:
-        yield {"type": "status", "message": "Searching the documents"}
-        sources = retrieve(standalone)
+    with tracing.span(f"retrieve-{decision.route}", as_type="retriever", input=standalone) as step:
+        if decision.route == "agentic":
+            for item in agentic_retrieve(standalone):
+                if isinstance(item, dict):
+                    yield {"type": "status", "message": item["status"]}
+                else:
+                    sources = item
+        else:
+            yield {"type": "status", "message": "Searching the documents"}
+            sources = retrieve(standalone)
+        sources = _drop_noise(sources)
+        step.update(output=[f"[{s.number}] {s.title} {s.citation_label} ({s.score:.2f})"
+                            for s in sources])
 
-    sources = _drop_noise(sources)
     yield {"type": "sources", "sources": [s.to_dict() for s in sources]}
 
     if not sources:

@@ -42,26 +42,38 @@ def _ensure_alias(client: QdrantClient, alias: str, collection: str) -> None:
         )
 
 
+def create_chunks_collection(name: str, dimensions: int) -> None:
+    """Dense (cosine) + BM25 vectors, int8-quantized, with an index on doc_id."""
+    client = get_qdrant()
+    if client.collection_exists(name):
+        return
+    client.create_collection(
+        name,
+        vectors_config={"dense": models.VectorParams(size=dimensions,
+                                                     distance=models.Distance.COSINE)},
+        sparse_vectors_config={"bm25": models.SparseVectorParams(modifier=models.Modifier.IDF)},
+        quantization_config=_int8(),
+    )
+    client.create_payload_index(name, "doc_id", models.PayloadSchemaType.KEYWORD)
+
+
+def create_documents_collection(name: str, dimensions: int) -> None:
+    """One summary vector per document."""
+    client = get_qdrant()
+    if not client.collection_exists(name):
+        client.create_collection(
+            name, quantization_config=_int8(),
+            vectors_config={"dense": models.VectorParams(size=dimensions,
+                                                         distance=models.Distance.COSINE)},
+        )
+
+
 def ensure_collections() -> None:
     """Create the collections + aliases if missing. Safe to run many times."""
     settings = get_settings()
     client = get_qdrant()
-    dense = models.VectorParams(size=settings.embedding_dimensions, distance=models.Distance.COSINE)
-
-    if not client.collection_exists(CHUNKS_VERSION):
-        client.create_collection(
-            CHUNKS_VERSION,
-            vectors_config={"dense": dense},
-            sparse_vectors_config={"bm25": models.SparseVectorParams(modifier=models.Modifier.IDF)},
-            quantization_config=_int8(),
-        )
-        client.create_payload_index(CHUNKS_VERSION, "doc_id", models.PayloadSchemaType.KEYWORD)
-
-    if not client.collection_exists(DOCUMENTS_VERSION):
-        client.create_collection(
-            DOCUMENTS_VERSION, vectors_config={"dense": dense}, quantization_config=_int8()
-        )
-
+    create_chunks_collection(CHUNKS_VERSION, settings.embedding_dimensions)
+    create_documents_collection(DOCUMENTS_VERSION, settings.embedding_dimensions)
     _ensure_alias(client, settings.chunks_collection, CHUNKS_VERSION)
     _ensure_alias(client, settings.documents_collection, DOCUMENTS_VERSION)
 
@@ -86,6 +98,20 @@ def delete_document(doc_id: str) -> None:
     )
     client.delete(settings.chunks_collection, points_selector=models.FilterSelector(filter=doc_filter))
     client.delete(settings.documents_collection, points_selector=[doc_id])
+
+
+def set_version(doc_id: str, is_latest: bool, confidence: str | None,
+                newer_title: str | None) -> None:
+    """Mark every chunk (and the summary) of a document as latest or older version."""
+    settings = get_settings()
+    client = get_qdrant()
+    payload = {"is_latest": is_latest, "version_confidence": confidence,
+               "newer_version_title": newer_title}
+    doc_filter = models.Filter(
+        must=[models.FieldCondition(key="doc_id", match=models.MatchValue(value=doc_id))]
+    )
+    client.set_payload(settings.chunks_collection, payload=payload, points=doc_filter, wait=True)
+    client.set_payload(settings.documents_collection, payload=payload, points=[doc_id], wait=True)
 
 
 # ---------- reads ----------

@@ -8,7 +8,7 @@ import { ChangeEvent, useCallback, useEffect, useState } from "react";
 import AuthGate from "@/components/AuthGate";
 import IngestionStages from "@/components/IngestionStages";
 import { apiFetch } from "@/lib/api";
-import type { DocumentInfo, User } from "@/lib/types";
+import type { DocumentInfo, QueueSummary, User } from "@/lib/types";
 
 const ACCEPT = ".pdf,.docx,.pptx,.html,.htm,.md";
 const REFRESH_MS = 2000;
@@ -19,10 +19,12 @@ export default function DocumentsPage() {
 
 function DocumentList({ user }: { user: User }) {
   const [documents, setDocuments] = useState<DocumentInfo[]>([]);
+  const [queue, setQueue] = useState<QueueSummary | null>(null);
   const [message, setMessage] = useState("");
 
   const load = useCallback(() => {
     apiFetch<DocumentInfo[]>("/documents").then(setDocuments).catch(() => undefined);
+    apiFetch<QueueSummary>("/documents/queue").then(setQueue).catch(() => undefined);
   }, []);
 
   // Refresh every few seconds so stage changes show up while documents are processed.
@@ -39,8 +41,10 @@ function DocumentList({ user }: { user: User }) {
       const form = new FormData();
       form.append("file", file);
       try {
-        await apiFetch("/documents", { method: "POST", body: form });
-        setMessage(`Uploaded ${file.name}; processing…`);
+        const result = await apiFetch<{ outcome: string }>("/documents", { method: "POST", body: form });
+        setMessage(result.outcome === "queued"
+          ? `Uploaded ${file.name}; queued for processing…`
+          : `${file.name} is already in the library (same content), skipped.`);
       } catch (err) {
         setMessage(`${file.name}: ${err instanceof Error ? err.message : "upload failed"}`);
       }
@@ -68,6 +72,7 @@ function DocumentList({ user }: { user: User }) {
           <input type="file" accept={ACCEPT} multiple onChange={upload} hidden />
         </label>
       </header>
+      {queue && <QueueLine queue={queue} />}
       {message && <p className="muted">{message}</p>}
 
       {documents.length === 0 && (
@@ -89,6 +94,35 @@ function DocumentList({ user }: { user: User }) {
   );
 }
 
+function QueueLine({ queue }: { queue: QueueSummary }) {
+  if (queue.queued + queue.running + queue.failed === 0) return null;
+  return (
+    <p className="small queue-line">
+      Processing queue: {queue.running} running · {queue.queued} waiting · {queue.done} done
+      {queue.failed > 0 && <span className="error-text"> · {queue.failed} failed</span>}
+      {queue.avg_seconds_per_doc && <span className="muted"> · ~{queue.avg_seconds_per_doc} s per document</span>}
+    </p>
+  );
+}
+
+const VERSION_REASON = {
+  explicit: "by version number or date",
+  inferred: "guessed from the file name or dates; check if this is right",
+  duplicate: "same text",
+};
+
+function VersionNote({ doc }: { doc: DocumentInfo }) {
+  const newer = doc.newer_version!;
+  const kind = doc.version_confidence === "duplicate" ? "Copy of" : "Older version of";
+  const reason = doc.version_confidence ? VERSION_REASON[doc.version_confidence] : "";
+  return (
+    <div className="warning small">
+      {kind} <strong>{newer.title}</strong> ({newer.source_name}) — {reason}. Still searchable,
+      ranked lower.
+    </div>
+  );
+}
+
 type CardProps = { doc: DocumentInfo; isAdmin: boolean; onStop: () => void; onDelete: () => void };
 
 function DocumentCard({ doc, isAdmin, onStop, onDelete }: CardProps) {
@@ -105,6 +139,7 @@ function DocumentCard({ doc, isAdmin, onStop, onDelete }: CardProps) {
             {doc.source_name} · {doc.file_format.toUpperCase()}
             {doc.page_count ? ` · ${doc.page_count} pages` : ""}
             {doc.chunk_count ? ` · ${doc.chunk_count} chunks` : ""}
+            {doc.effective_date ? ` · dated ${doc.effective_date}` : ""}
           </div>
         </div>
         <span className={`badge ${doc.status}`}>{stopping ? "stopping" : doc.status}</span>
@@ -125,11 +160,15 @@ function DocumentCard({ doc, isAdmin, onStop, onDelete }: CardProps) {
 
       <IngestionStages doc={doc} />
 
+      {doc.newer_version && <VersionNote doc={doc} />}
       {doc.summary && <p className="small summary">{doc.summary}</p>}
       {doc.warnings.map((w) => <div key={w} className="warning small">⚠ {w}</div>)}
       {doc.error && <div className="error small">{doc.error}</div>}
       {doc.status === "cancelled" && (
         <div className="muted small">Processing was stopped. Upload the file again to retry.</div>
+      )}
+      {doc.job?.status === "queued" && doc.job.error && (
+        <div className="muted small">Will retry after: {doc.job.error}</div>
       )}
     </div>
   );

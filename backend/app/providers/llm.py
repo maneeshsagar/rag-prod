@@ -17,7 +17,9 @@ from collections.abc import Iterator
 from functools import lru_cache
 from typing import Literal
 
+from app.core import tracing
 from app.core.config import get_settings
+from app.core.usage import UsageMeter, track_usage
 from app.providers.llm_base import LLMProvider, ProviderUnavailable, T
 
 log = logging.getLogger(__name__)
@@ -56,6 +58,12 @@ def _warn_once(name: str, error: Exception) -> None:
     log.log(level, "LLM %s unavailable, using fallback: %s", name, error)
 
 
+def _usage_fields(meter: UsageMeter) -> dict:
+    """Token counts and cost in the shape Langfuse expects."""
+    return {"usage_details": {"input": meter.tokens_in, "output": meter.tokens_out},
+            "cost_details": {"total": meter.cost_usd}}
+
+
 class LLM:
     def __init__(self, models: dict[str, str], fallbacks: dict[str, str], effort: str) -> None:
         self.models = models
@@ -76,9 +84,14 @@ class LLM:
         for name in self._candidates(kind):
             provider, model = split_model(name)
             try:
-                return get_provider(provider).complete_json(
-                    model, system, user, schema, max_tokens, effort="low"  # quick tasks
-                )
+                with tracing.span(f"llm-{kind}-{schema.__name__}", as_type="generation", model=name,
+                                  input={"system": system, "user": user}) as generation, \
+                        track_usage() as meter:
+                    result = get_provider(provider).complete_json(
+                        model, system, user, schema, max_tokens, effort="low"  # quick tasks
+                    )
+                    generation.update(output=result.model_dump(), **_usage_fields(meter))
+                return result
             except ProviderUnavailable as error:
                 _warn_once(name, error)
                 last_error = error
@@ -91,11 +104,17 @@ class LLM:
             provider, model = split_model(name)
             sent_text = False
             try:
-                for text in get_provider(provider).stream_text(
-                    model, system, messages, max_tokens, self.effort
-                ):
-                    sent_text = True
-                    yield text
+                with tracing.span(f"llm-{kind}-stream", as_type="generation", model=name,
+                                  input={"system": system, "messages": messages}) as generation, \
+                        track_usage() as meter:
+                    parts: list[str] = []
+                    for text in get_provider(provider).stream_text(
+                        model, system, messages, max_tokens, self.effort
+                    ):
+                        sent_text = True
+                        parts.append(text)
+                        yield text
+                    generation.update(output="".join(parts), **_usage_fields(meter))
                 return
             except ProviderUnavailable as error:
                 if sent_text:  # half an answer was already shown; don't start over

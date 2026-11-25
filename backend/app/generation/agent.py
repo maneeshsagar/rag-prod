@@ -18,7 +18,7 @@ from app.providers.embedder import get_embedder
 from app.providers.llm import get_llm
 from app.providers.reranker import rerank
 from app.retrieval import vector_store
-from app.retrieval.search import Hit, Source, build_sources, search_chunks
+from app.retrieval.search import Hit, Source, build_sources, search_chunks, version_note
 
 AGENT_TOP_K = 10  # more context than the simple route: several topics are involved
 SNIPPET_CHARS = 300
@@ -54,6 +54,7 @@ def _document_list_sources(question: str, start_number: int) -> list[Source]:
             text=f"{p.payload['summary']}\nTopics: {', '.join(p.payload['topics'])}"
                  f"\nDate: {p.payload['document_date']}",
             score=p.score,
+            version_note=version_note(p.payload),
         )
         for i, p in enumerate(points)
     ]

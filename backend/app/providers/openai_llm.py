@@ -11,6 +11,7 @@ from contextlib import contextmanager
 
 import openai
 
+from app.core.usage import record
 from app.providers.llm_base import ModelRefusal, ProviderUnavailable, T
 
 
@@ -25,6 +26,15 @@ def _translate_errors():
         if error.status_code >= 500:
             raise ProviderUnavailable(f"openai: {error}") from error
         raise
+
+
+def _record_usage(model: str, usage) -> None:
+    if usage is None:
+        return
+    details = usage.prompt_tokens_details
+    cached = (details.cached_tokens or 0) if details else 0
+    # completion_tokens includes the hidden reasoning tokens, which are billed as output.
+    record(model, usage.prompt_tokens, usage.completion_tokens, cached)
 
 
 class OpenAILLM:
@@ -44,6 +54,7 @@ class OpenAILLM:
                 max_completion_tokens=max_tokens,
                 reasoning_effort=effort,
             )
+        _record_usage(response.model, response.usage)
         message = response.choices[0].message
         if message.refusal or message.parsed is None:
             raise ModelRefusal(message.refusal or "no structured output returned")
@@ -58,7 +69,10 @@ class OpenAILLM:
                 max_completion_tokens=max_tokens,
                 reasoning_effort=effort,
                 stream=True,
+                stream_options={"include_usage": True},  # last chunk carries token counts
             )
             for chunk in stream:
                 if chunk.choices and chunk.choices[0].delta.content:
                     yield chunk.choices[0].delta.content
+                if chunk.usage:
+                    _record_usage(chunk.model, chunk.usage)

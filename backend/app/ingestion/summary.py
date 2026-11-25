@@ -20,7 +20,7 @@ SYSTEM = (
 class DocumentSummary(BaseModel):
     summary: str  # 3-5 sentences: purpose, scope, key points
     topics: list[str]  # 3-8 key topics
-    document_date: str  # date the document states (effective / published), or "unknown"
+    document_date: str  # date the document states, as YYYY-MM-DD, YYYY-MM or YYYY; or "unknown"
 
 
 def summarize(title: str, sections: list[Section]) -> DocumentSummary:
@@ -30,6 +30,7 @@ def summarize(title: str, sections: list[Section]) -> DocumentSummary:
         f"Title: {title}\n\nOutline:\n{first_tokens(outline, 1_500)}\n\n"
         f"<document>\n{body}\n</document>\n\n"
         "Summarize this document: purpose, scope and key points (3-5 sentences), "
-        "its key topics, and the date it states (or 'unknown')."
+        "its key topics, and the effective or publication date it states, written as "
+        "YYYY-MM-DD, YYYY-MM or YYYY (or 'unknown' if it states none)."
     )
     return get_llm().json("fast", SYSTEM, user, DocumentSummary, max_tokens=4_000)

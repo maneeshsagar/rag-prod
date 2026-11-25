@@ -221,7 +221,7 @@ Section: <H1 > H2 > H3 breadcrumb>
 ### 4.10 Indexing & Consistency
 - Versioned Qdrant collections (`chunks_v1`) behind an alias → zero-downtime re-index
 - **Outbox pattern** for Postgres → Qdrant writes
-- Idempotent Celery tasks (`acks_late`, idempotency keys), resumable ingest
+- Postgres-backed job queue (`FOR UPDATE SKIP LOCKED`), retries with backoff, resumable ingest (decided in Phase 2 instead of Celery)
 - **Reconciliation job**: Postgres ⇄ Qdrant ⇄ storage; report drift, purge orphans
 - Every document upsert/delete increments a **corpus revision counter** (used by the answer cache)
 
@@ -543,7 +543,7 @@ rag-prod/
 | Phase | Weeks | Where | Deliverables | Exit criteria |
 |---|---|---|---|---|
 | **1. Core pipeline** ✅ | 1–2 | Local · 5–6 docs | docker-compose stack; Anthropic + OpenAI SDKs with fallback; OpenAI embeddings; local reranker; tiered parsing (all 5 formats); hierarchical chunking + headers; doc summary index; hybrid search + RRF + rerank; context budget; citations + verification; simple RAG + basic agentic route; chat UI (streaming, sources, history, feedback); question generator + ~20–30 reviewed questions; `make eval` | All formats ingest cleanly; lookup / table / analytical / multi-hop / unanswerable questions answered correctly with citations or properly abstained |
-| **2. Accuracy tuning** | 3–5 | Local · 1–2k docs | Ingest 1–2k sample (resumable); golden set 200–400 Qs (drafted + reviewed); benchmark embeddings (3-large vs 3-small, dims), reranker, Claude vs GPT for generation; A/B per-chunk contextualization; dedup/versioning; router tuning; **lock chunking + models**; CI eval gate; cost per query measured | Accuracy targets met per category; models + chunking locked; cost per query known |
+| **2. Accuracy tuning** 🔨 | 3–5 | Local · 1–2k docs | Ingest 1–2k sample (resumable); golden set 200–400 Qs (drafted + reviewed); benchmark embeddings (3-large vs 3-small, dims), reranker, Claude vs GPT for generation; A/B per-chunk contextualization; dedup/versioning; router tuning; **lock chunking + models**; CI eval gate; cost per query measured | Accuracy targets met per category; models + chunking locked; cost per query known |
 | **3. Feature-complete** | 6–7 | Local | Typed field tables + extraction + SQL route (with RAG fallback); admin page; open-original-at-page; exact cache + embedding cache; rate limits; outbox + reconciliation; DLQ; provider fallback; local k6 smoke load test; security review | Every question category handled; all features working locally; eval stable |
 | **4. Move to AWS** | 8–10 | AWS | Terraform (staging + prod); security baseline; ECS, RDS, ElastiCache, S3, Qdrant, reranker container; Secrets Manager; SSO; CI/CD; full-corpus cost estimate + sign-off; **full 30k–50k ingest** (Batch APIs, parallel workers); backups + restore rehearsal; k6 at 40 QPS + outage drills | Eval on full corpus ≥ local results; SLOs met under load; restore rehearsed |
 | **5. Launch** | 11–12 | AWS production | Pilot 200 → 1,000 → 2,000 users; weekly bad-answer review; enable ACLs when needed | SLOs met; feedback acceptable; eval trend up |
@@ -561,6 +561,28 @@ rag-prod/
 - First `make eval` run with Claude on reviewed questions.
 - Langfuse tracing (needs Langfuse keys).
 - Deferred as planned: Docling path (only if the sample needs it), Alembic.
+
+### Phase 2 status: 🔨 tooling built (2026-11-25) — waiting for the 1–2k sample
+Built and tested on the small test documents (not on a bulk sample yet, by choice):
+- **Bulk ingestion queue** (`app/ingestion/queue.py`, `worker.py`): Postgres-backed (`SELECT … FOR UPDATE SKIP LOCKED`), any number of workers (`make worker`), the API runs one too. Tested: 2 workers in parallel; worker killed with `kill -9` mid-embedding → re-queued and finished with exactly the right chunk count; broken file → failed at once; API error → retried with backoff (1, 2, 4 min, 3 attempts); Stop while queued. `make ingest-status` (speed, ETA, failures by type), `make ingest-retry`.
+- **Duplicates & versions** (`fingerprint.py`, `versions.py`): MinHash (128) + LSH bands in Postgres; version order from version number → stated date → "copy/updated/draft" in the name → file modified time → upload order. Older versions are **down-ranked (×0.3 explicit / ×0.7 inferred), not hidden**, and the answer model is told which document is newer. Tested end to end (v1 140 EUR vs v2 165 EUR → answers 165, mentions the old value). `make versions` recomputes links.
+- **Language check** (quality gate): flags mostly-non-English documents; they are left out of question generation.
+- **Cost tracking** (`app/core/usage.py`): tokens + $ for every LLM / embedding call; saved per answer (`messages.cost_usd`) and per ingested document; `make ingest-status` projects the full-corpus ingest cost. First measurement: **~$0.01 per question** (Sonnet answers, Haiku routing).
+- **Benchmarks**: `run_eval --name X --set KEY=VALUE` (any setting), cost per question in the report, `eval.compare A.json B.json`; `scripts/build_index_variant.py` builds a second index with another embedding model ($0.0014 for the current corpus). Questions now find their document by file name, so the golden set survives re-ingestion.
+- **Question generator** for the 200–400 set: `make questions` drafts 300 by default, spread over formats, with the category mix (table, multi-hop from the same chapter, conflicting from version pairs, unanswerable); aggregation is added by hand.
+- **Langfuse tracing** (`app/core/tracing.py`): one trace per question (route → retrieve → answer), generations with model / tokens / cost, session = conversation. Off until the keys are in `.env`.
+- **CI** (`.github/workflows/ci.yml`): lint + tests on every push; eval gate on the 5 synthetic CI documents (`eval/ci_corpus/`, questions tagged `ci`) when a PR has the `run-eval` label (~$0.05/run).
+
+**Changed from the plan:**
+- Postgres queue instead of Celery: same guarantees (durable, resumable, idempotent), one less service; revisit on AWS if needed (SQS).
+- Older versions are down-ranked even when the version is explicit (not hard-filtered), so "what did the 2023 version say?" still works. Weights are config and get tuned on the sample.
+- `gpt-5-mini` (judge, fast fallback) is marked deprecated by OpenAI → choose its replacement during the model benchmarks.
+
+**Needs the 1–2k sample (in this order):**
+1. `make ingest DIR=data/sample` (+ 1–2 `make worker`) → parse failures, speed, cost per document.
+2. `make questions` → you review ~300 questions (+ add aggregation ones).
+3. Benchmarks: embeddings (3-large vs 3-small), reranker on/off, Claude vs GPT for answers, chunk sizes, per-chunk contextualization A/B.
+4. Lock models + chunking; set the CI gate threshold; cost per query target.
 
 ---
 

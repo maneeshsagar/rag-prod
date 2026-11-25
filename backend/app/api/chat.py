@@ -20,6 +20,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 
+from app.core import tracing
 from app.core.auth import current_user
 from app.db.models import Conversation, Message, User
 from app.db.session import SessionLocal
@@ -57,9 +58,15 @@ def _error_message(error: Exception) -> str:
     return "Something went wrong while answering. Please try again."
 
 
-def _produce_answer(conversation_id: str, question: str, history: list[dict],
+def _produce_answer(user_id: str, conversation_id: str, question: str, history: list[dict],
                     events: queue.Queue) -> None:
-    """Runs in a background thread: answer the question, save it, push SSE events."""
+    """Runs in a background thread: answer the question (traced), save it, push SSE events."""
+    with tracing.trace("chat", user_id=user_id, session_id=conversation_id, input=question) as root:
+        _answer_and_save(conversation_id, question, history, events, root)
+
+
+def _answer_and_save(conversation_id: str, question: str, history: list[dict],
+                     events: queue.Queue, root) -> None:
     try:
         for event in answer_question(question, history):
             if event["type"] != "done":
@@ -75,6 +82,9 @@ def _produce_answer(conversation_id: str, question: str, history: list[dict],
                     route=event["route"],
                     model=event["model"],
                     latency_ms=event["latency_ms"],
+                    tokens_in=event["usage"]["tokens_in"],
+                    tokens_out=event["usage"]["tokens_out"],
+                    cost_usd=event["usage"]["cost_usd"],
                 )
                 session.add(message)
                 conversation = session.get(Conversation, conversation_id)
@@ -83,6 +93,9 @@ def _produce_answer(conversation_id: str, question: str, history: list[dict],
                 session.commit()
                 done = {k: v for k, v in event.items() if k not in ("type", "sources")}
                 events.put(sse("done", {**done, "message_id": message.id}))
+                root.update(output=event["answer"], metadata={
+                    "route": event["route"], "message_id": message.id,
+                    "cost_usd": event["usage"]["cost_usd"], "not_found": event["not_found"]})
     except Exception as error:
         log.exception("chat failed")
         # Save the failure too, so the conversation never ends with an unanswered question.
@@ -134,7 +147,7 @@ def _start_chat(user_id: str, request: ChatRequest) -> tuple[str, str, queue.Que
 
     events: queue.Queue = queue.Queue()
     threading.Thread(
-        target=_produce_answer, args=(conversation_id, request.question, history, events),
+        target=_produce_answer, args=(user_id, conversation_id, request.question, history, events),
         daemon=True, name=f"chat-{conversation_id[:8]}",
     ).start()
     return conversation_id, title, events

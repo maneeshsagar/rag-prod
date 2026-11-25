@@ -1,21 +1,24 @@
 """
-Ingest one file:  store -> parse -> quality check -> chunk -> embed -> index -> summarize.
+Ingest documents:  parse -> quality check -> chunk -> embed -> index -> summarize.
 
-    ingest_file(Path("data/smoke/handbook.pdf"))
+    ingest_file(Path("data/smoke/handbook.pdf"))   # queue it and process it right here
+    run_job(job_id)                                # what a worker does with a queued job
 
-- Same content already indexed (SHA-256 match)  -> skipped.
-- Same file name with new content                -> the old version is replaced.
-- Any failure                                    -> document marked "failed" with the error.
+Files are first queued (ingestion/queue.py stores the original); a worker then runs them.
+
+- Same content already indexed (SHA-256 match)  -> skipped when queued.
+- Same source name with new content              -> the old version is replaced once the
+                                                    new one is fully indexed.
+- Error while parsing / chunking                 -> "failed" (retrying would not help).
+- Error later (API down, rate limit, ...)        -> re-queued, up to 3 attempts.
 - "Stop" pressed (cancel_requested on the job)    -> stops at the next checkpoint, removes
                                                      what was indexed, marks it "cancelled".
 
-Stages (shown in the UI): store -> parse -> chunk -> embed -> index -> summarize -> done
+Stages (shown in the UI): queued -> parse -> chunk -> embed -> index -> summarize -> done
 """
 
-import hashlib
 import logging
-import os
-import socket
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -23,9 +26,11 @@ from qdrant_client import models
 from sqlalchemy import delete, func, select
 
 from app.core.config import get_settings
+from app.core.usage import track_usage
 from app.db.models import CorpusRevision, Document, IngestionJob
 from app.db.models import Section as SectionRow
 from app.db.session import SessionLocal
+from app.ingestion import queue, versions
 from app.ingestion.chunker import (
     ChunkSettings,
     Section,
@@ -33,7 +38,7 @@ from app.ingestion.chunker import (
     chunk_header,
     citation_label,
 )
-from app.ingestion.parsers import file_format, parse_file
+from app.ingestion.parsers import parse_file
 from app.ingestion.quality import check_quality
 from app.ingestion.summary import summarize
 from app.providers.embedder import get_embedder
@@ -42,33 +47,6 @@ from app.retrieval import vector_store
 from app.storage.object_store import get_object_store
 
 log = logging.getLogger(__name__)
-
-
-WORKER = f"{socket.gethostname()}:{os.getpid()}"  # identifies this process on the job
-
-
-def _worker_alive(worker: str | None) -> bool:
-    """Is the process that owns a job still running? (Only checkable on this machine.)"""
-    if not worker:
-        return False
-    host, _, pid = worker.rpartition(":")
-    if host != socket.gethostname():
-        return True  # another machine: assume alive
-    try:
-        os.kill(int(pid), 0)  # signal 0 = "does it exist?", sends nothing
-        return True
-    except (ProcessLookupError, ValueError):
-        return False
-    except PermissionError:
-        return True
-
-
-def file_hash(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as file:
-        for block in iter(lambda: file.read(1 << 20), b""):
-            digest.update(block)
-    return digest.hexdigest()
 
 
 class IngestionCancelled(Exception):
@@ -144,6 +122,7 @@ def _build_points(doc: Document, sections: list[Section], section_ids: dict[int,
             "text": chunk.text,
             "token_count": chunk.token_count,
             "acl_groups": ["public"],  # everyone sees everything for now
+            "is_latest": True,  # changed by ingestion/versions.py when a newer version arrives
         }
         points.append(models.PointStruct(
             id=chunk_ids[i], vector={"dense": dense[i], "bm25": sparse[i]}, payload=payload
@@ -151,134 +130,159 @@ def _build_points(doc: Document, sections: list[Section], section_ids: dict[int,
     return points
 
 
-def _clean_up_partial(session, doc_id: str, storage_key: str) -> None:
-    """Remove what a failed or stopped ingest left behind (the document row stays).
+def _clean_up_partial(session, doc_id: str) -> None:
+    """Remove what a failed or stopped ingest left in the index (the document row stays).
 
-    Best effort: if Qdrant or storage is down, log it and carry on, so the document's
-    status is still saved (orphans are removed by the reconciliation job, Phase 3).
+    Best effort: if Qdrant is down, log it and carry on, so the document's status is
+    still saved (orphans are removed by the reconciliation job, Phase 3).
     """
-    for step in (lambda: vector_store.delete_document(doc_id),
-                 lambda: get_object_store().delete(storage_key)):
-        try:
-            step()
-        except Exception:
-            log.warning("  cleanup step failed for %s", doc_id, exc_info=True)
+    try:
+        vector_store.delete_document(doc_id)
+    except Exception:
+        log.warning("  cleanup failed for %s", doc_id, exc_info=True)
     session.execute(delete(SectionRow).where(SectionRow.document_id == doc_id))
 
 
 def _remove_document(session, doc: Document) -> None:
+    versions.forget_versions(session, doc)
     vector_store.delete_document(doc.id)
     get_object_store().delete(doc.storage_key)
     session.delete(doc)
 
 
-def ingest_file(path: Path) -> str:
-    """Ingest one file and return its document id."""
+def _index_document(session, doc: Document, job: IngestionJob, path: Path) -> None:
+    """All the stages, from parsing the file to replacing older versions."""
     settings = get_settings()
-    content_hash = file_hash(path)
 
+    _advance(session, job, "parse")
+    parsed = parse_file(path)
+    doc.title, doc.page_count = parsed.title, parsed.page_count
+    doc.parse_path = "fast"
+    doc.warnings = check_quality(parsed)
+    if not parsed.blocks:
+        raise ValueError("; ".join(doc.warnings) or "no text extracted")
+
+    _advance(session, job, "chunk")
+    sections = chunk_document(parsed, ChunkSettings(
+        settings.chunk_target_tokens, settings.chunk_max_tokens, settings.chunk_overlap_tokens
+    ))
+    section_ids = _save_sections(session, doc.id, sections)
+
+    chunk_total = sum(len(s.chunks) for s in sections)
+    _advance(session, job, "embed", f"0/{chunk_total} chunks")
+    points = _build_points(
+        doc, sections, section_ids,
+        on_batch=lambda done, total: _advance(session, job, "embed", f"{done}/{total} chunks"),
+    )
+
+    _advance(session, job, "index", f"{len(points)} chunks")
+    vector_store.upsert_chunks(points)
+
+    _advance(session, job, "summarize")
+    summary = summarize(doc.title, sections)
+    doc.summary = summary.summary
+    doc.effective_date = versions.normalize_date(summary.document_date)
+    doc.version_label = versions.version_label(doc.source_name, doc.title)
+    vector_store.upsert_document_summary(models.PointStruct(
+        id=doc.id,
+        vector={"dense": get_embedder().embed_documents(
+            [f"{doc.title}\n{summary.summary}\nTopics: {', '.join(summary.topics)}"]
+        )[0]},
+        payload={"doc_id": doc.id, "title": doc.title, "summary": summary.summary,
+                 "topics": summary.topics, "document_date": summary.document_date,
+                 "file_format": doc.file_format},
+    ))
+
+    # Last chance to stop. Must come BEFORE older versions are removed, so a
+    # Stop here never leaves the user with neither the old nor the new version.
+    _advance(session, job, "summarize")
+
+    for old in session.scalars(select(Document).where(
+        Document.source_name == doc.source_name, Document.id != doc.id,
+        Document.status != "pending",
+    )):
+        log.info("  replacing older version %s", old.id)
+        _remove_document(session, old)
+
+    # Near-copies under other names (e.g. "policy v2.pdf" vs "policy v3.pdf").
+    versions.link_versions(session, doc, "\n\n".join(section.text for section in sections))
+
+    doc.status, doc.chunk_count, doc.indexed_at = "indexed", len(points), func.now()
+    log.info("  done: %d sections, %d chunks", len(sections), len(points))
+
+
+PERMANENT_STAGES = {"parse", "chunk"}  # errors here come from the file itself
+
+
+def _handle_failure(session, doc: Document, job: IngestionJob, error: Exception,
+                    temp_folder: str) -> None:
+    """Decide what a failed attempt means: stopped, retry later, or failed for good."""
+    _clean_up_partial(session, doc.id)
+    job.finished_at = func.now()
+    stage = job.stage
+
+    if isinstance(error, IngestionCancelled):
+        doc.status = job.status = "cancelled"
+        get_object_store().delete(doc.storage_key)
+        log.info("  stopped by user at stage %s", stage)
+        return
+
+    # Parser errors mention the temporary copy; show the file name instead.
+    message = f"{type(error).__name__}: {error}".replace(f"{temp_folder}/", "")
+    if stage not in PERMANENT_STAGES and queue.retry_later(job, f"[{stage}] {message}"):
+        log.warning("  temporary error at stage %s, will retry: %s", stage, message)
+        return
+
+    # The original file is kept, so `make ingest-retry` can try again after a fix.
+    doc.status, doc.error = "failed", message
+    job.status, job.error = "failed", message
+    log.error("  failed at stage %s: %s", job.stage, message)
+
+
+def run_job(job_id: str) -> str:
+    """Process one claimed job (see queue.claim_job). Returns the document's final status."""
     with SessionLocal() as session:
-        existing = session.scalar(
-            select(Document).where(Document.content_hash == content_hash, Document.status == "indexed")
-        )
-        if existing:
-            log.info("skip (unchanged): %s", path.name)
-            return existing.id
+        job = session.get(IngestionJob, job_id)
+        doc = session.get(Document, job.document_id)
+        log.info("ingest: %s (attempt %d)", doc.source_name, job.attempts)
 
-        doc = Document(
-            title=path.stem, source_name=path.name, storage_key="", file_format=file_format(path),
-            content_hash=content_hash, status="pending",
-        )
-        session.add(doc)
-        session.flush()
-        doc.storage_key = f"originals/{doc.id}{path.suffix.lower()}"
-        job = IngestionJob(document_id=doc.id, stage="store", status="running", attempts=1,
-                           worker=WORKER)
-        session.add(job)
-        session.commit()
-        log.info("ingest: %s", path.name)
-
-        try:
-            get_object_store().upload_file(path, doc.storage_key)
-
-            _advance(session, job, "parse")
-            parsed = parse_file(path)
-            doc.title, doc.page_count = parsed.title, parsed.page_count
-            doc.parse_path = "fast"
-            doc.warnings = check_quality(parsed)
-            if not parsed.blocks:
-                raise ValueError("; ".join(doc.warnings) or "no text extracted")
-
-            _advance(session, job, "chunk")
-            sections = chunk_document(parsed, ChunkSettings(
-                settings.chunk_target_tokens, settings.chunk_max_tokens, settings.chunk_overlap_tokens
-            ))
-            section_ids = _save_sections(session, doc.id, sections)
-
-            chunk_total = sum(len(s.chunks) for s in sections)
-            _advance(session, job, "embed", f"0/{chunk_total} chunks")
-            points = _build_points(
-                doc, sections, section_ids,
-                on_batch=lambda done, total: _advance(session, job, "embed", f"{done}/{total} chunks"),
-            )
-
-            _advance(session, job, "index", f"{len(points)} chunks")
-            vector_store.upsert_chunks(points)
-
-            _advance(session, job, "summarize")
-            summary = summarize(doc.title, sections)
-            doc.summary = summary.summary
-            vector_store.upsert_document_summary(models.PointStruct(
-                id=doc.id,
-                vector={"dense": get_embedder().embed_documents(
-                    [f"{doc.title}\n{summary.summary}\nTopics: {', '.join(summary.topics)}"]
-                )[0]},
-                payload={"doc_id": doc.id, "title": doc.title, "summary": summary.summary,
-                         "topics": summary.topics, "document_date": summary.document_date,
-                         "file_format": doc.file_format},
-            ))
-
-            # Last chance to stop. Must come BEFORE older versions are removed, so a
-            # Stop here never leaves the user with neither the old nor the new version.
-            _advance(session, job, "summarize")
-
-            # Replace older versions of the same file.
-            for old in session.scalars(select(Document).where(
-                Document.source_name == doc.source_name, Document.id != doc.id
-            )):
-                log.info("  replacing older version %s", old.id)
-                _remove_document(session, old)
-
-            doc.status, doc.chunk_count, doc.indexed_at = "indexed", len(points), func.now()
-            job.stage, job.status, job.progress = "done", "done", None
-            _bump_corpus_revision(session)
-            session.commit()
-            log.info("  done: %d sections, %d chunks", len(sections), len(points))
-            return doc.id
-
-        except Exception as error:
-            session.rollback()
-            doc = session.get(Document, doc.id)
-            job = session.get(IngestionJob, job.id)
-            _clean_up_partial(session, doc.id, doc.storage_key)
-
-            if isinstance(error, IngestionCancelled):
-                doc.status = job.status = "cancelled"
+        with tempfile.TemporaryDirectory() as folder:
+            try:
+                # Named like the original, so parsers and their messages see the real name.
+                path = Path(folder) / Path(doc.source_name).name
+                get_object_store().download_file(doc.storage_key, path)
+                with track_usage() as meter:
+                    _index_document(session, doc, job, path)
+                doc.ingest_tokens = meter.tokens_in + meter.tokens_out
+                doc.ingest_cost_usd = meter.cost_usd
+                job.stage, job.status, job.progress, job.error = "done", "done", None, None
+                job.finished_at = func.now()
+                _bump_corpus_revision(session)
                 session.commit()
-                log.info("  stopped by user at stage %s: %s", job.stage, path.name)
-                return doc.id
-
-            doc.status, doc.error = "failed", f"{type(error).__name__}: {error}"
-            job.status, job.error = "failed", doc.error
-            session.commit()
-            log.exception("  failed: %s", path.name)
-            raise
+            except Exception as error:  # noqa: BLE001 — every failure is recorded on the job
+                session.rollback()
+                doc, job = session.get(Document, doc.id), session.get(IngestionJob, job.id)
+                _handle_failure(session, doc, job, error, folder)
+                session.commit()
+        return doc.status
 
 
-def _end_job(session, doc: Document, job: IngestionJob, status: str, error: str | None) -> None:
-    _clean_up_partial(session, doc.id, doc.storage_key)
+def ingest_file(path: Path, source_name: str | None = None) -> str:
+    """Queue one file and process it in this process. Returns its document id."""
+    enqueued = queue.enqueue_file(path, source_name)
+    if enqueued.outcome == "queued":
+        with SessionLocal() as session:
+            job_id = session.scalar(select(IngestionJob.id).where(
+                IngestionJob.document_id == enqueued.doc_id))
+        if queue.claim_job(job_id):
+            run_job(job_id)
+    return enqueued.doc_id
+
+
+def _end_job(session, doc: Document, job: IngestionJob, status: str) -> None:
+    _clean_up_partial(session, doc.id)
+    get_object_store().delete(doc.storage_key)
     doc.status = job.status = status
-    doc.error = job.error = error
 
 
 def request_stop(doc_id: str) -> str:
@@ -291,27 +295,17 @@ def request_stop(doc_id: str) -> str:
         if doc.status != "pending" or job is None:
             return doc.status  # already finished: nothing to stop
 
-        if _worker_alive(job.worker):
+        if job.status == "running" and queue.worker_alive(job.worker):
             job.cancel_requested = True  # the running ingest stops at its next checkpoint
-        else:  # the process doing it is gone (e.g. the API restarted): cancel right away
-            _end_job(session, doc, job, "cancelled", None)
+        else:  # still waiting in the queue, or its worker is gone: cancel right away
+            _end_job(session, doc, job, "cancelled")
         session.commit()
         return doc.status
 
 
-def recover_interrupted_jobs() -> int:
-    """Mark ingests whose process died (API restart, crash) as failed. Run at API startup."""
-    with SessionLocal() as session:
-        running = session.scalars(select(IngestionJob).where(IngestionJob.status == "running")).all()
-        count = 0
-        for job in running:
-            doc = session.get(Document, job.document_id)
-            if doc is not None and not _worker_alive(job.worker):
-                _end_job(session, doc, job, "failed",
-                         f"Interrupted at stage '{job.stage}' (the server restarted). Upload again.")
-                count += 1
-        session.commit()
-        return count
+def recover_interrupted_jobs() -> tuple[int, int]:
+    """Re-queue ingests whose worker died. Returns (re-queued, failed for good)."""
+    return queue.recover_interrupted_jobs(lambda session, doc: _clean_up_partial(session, doc.id))
 
 
 def delete_document(doc_id: str) -> bool:

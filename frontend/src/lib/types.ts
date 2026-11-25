@@ -10,6 +10,7 @@ export type SourceInfo = {
   file_format: string;
   section_path: string;
   score: number;
+  version_note?: string | null; // "older version; newer: ..." or "copy of ..."
 };
 
 export type Citation = SourceInfo & {
@@ -34,9 +35,11 @@ export type ChatMessage = {
 export type ConversationSummary = { id: string; title: string; updated_at: string };
 
 export type IngestionJob = {
-  stage: string; // store | parse | chunk | embed | index | summarize | done
-  status: "running" | "done" | "failed" | "cancelled";
+  stage: string; // queued | parse | chunk | embed | index | summarize | done
+  status: "queued" | "running" | "done" | "failed" | "cancelled";
   progress: string | null; // e.g. "200/450 chunks"
+  error: string | null; // last error (a queued job with an error is waiting to retry)
+  attempts: number;
   stopping: boolean; // Stop was pressed; waiting for the next checkpoint
 };
 
@@ -52,5 +55,20 @@ export type DocumentInfo = {
   error: string | null;
   summary: string | null;
   created_at: string;
+  effective_date: string | null; // date the document states
+  is_latest: boolean;
+  version_confidence: "explicit" | "inferred" | "duplicate" | null;
+  newer_version: { id: string; title: string; source_name: string } | null;
   job: IngestionJob | null;
+};
+
+// Counts for the whole ingestion queue (GET /documents/queue).
+export type QueueSummary = {
+  queued: number;
+  running: number;
+  done: number;
+  failed: number;
+  cancelled: number;
+  done_last_hour: number;
+  avg_seconds_per_doc: number | null;
 };

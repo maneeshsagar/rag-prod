@@ -150,3 +150,7 @@ button.danger { background: var(--error); color: var(--accent-text); border-colo
   .chat { min-height: 70vh; }
   .sources { border-left: none; border-top: 1px solid var(--border); }
 }
+
+/* Ingestion queue summary on the documents page */
+.queue-line { margin: 4px 0 12px; }
+.error-text { color: var(--error); }

@@ -1,7 +1,7 @@
 # Common commands. Run `make help` to list them.
 
 .PHONY: help up s3-up down logs install init db-init db-reset storage-init index-init \
-        user ingest api web test lint questions eval
+        user ingest worker ingest-status ingest-retry versions api web test lint questions eval
 
 help:
 	@echo "make up            Start Postgres, Redis, Qdrant (Docker)"
@@ -12,7 +12,11 @@ help:
 	@echo "make init          Create database tables, storage folder/bucket, Qdrant collections"
 	@echo "make db-reset      Drop and recreate all tables (local development only)"
 	@echo "make user EMAIL=.. NAME=.. PASSWORD=.. [ROLE=admin]   Create a login"
-	@echo "make ingest DIR=data/smoke   Ingest a file or folder"
+	@echo "make ingest DIR=data/smoke   Queue a file or folder and process it [QUEUE=1: queue only]"
+	@echo "make worker        Run an extra ingestion worker (one per terminal)"
+	@echo "make ingest-status Queue counts, speed, failures"
+	@echo "make ingest-retry  Queue every failed document again"
+	@echo "make versions      Recompute near-duplicate / version links for all documents"
 	@echo "make api           Run the backend API on http://localhost:8010"
 	@echo "make web           Run the chat UI on http://localhost:3010"
 	@echo "make questions     Draft eval questions from indexed documents (you review them)"
@@ -56,7 +60,19 @@ user:
 
 DIR ?= data/smoke
 ingest:
-	cd backend && uv run python -m scripts.ingest "../$(DIR)"
+	cd backend && uv run python -m scripts.ingest "../$(DIR)" $(if $(QUEUE),--queue-only)
+
+worker:
+	cd backend && uv run python -m scripts.worker
+
+ingest-status:
+	cd backend && uv run python -m scripts.ingest_status
+
+ingest-retry:
+	cd backend && uv run python -m scripts.ingest_status --retry-failed
+
+versions:
+	cd backend && uv run python -m scripts.link_versions
 
 api:
 	cd backend && uv run uvicorn app.main:app --reload --port 8010

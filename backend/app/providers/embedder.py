@@ -14,6 +14,7 @@ import openai
 from redis import Redis
 
 from app.core.config import get_settings
+from app.core.usage import record
 
 BATCH_SIZE = 100
 QUERY_CACHE_SECONDS = 24 * 3600
@@ -21,7 +22,9 @@ QUERY_CACHE_SECONDS = 24 * 3600
 
 class Embedder:
     def __init__(self, api_key: str, model: str, dimensions: int, redis: Redis) -> None:
-        self.client = openai.OpenAI(api_key=api_key or "missing", max_retries=3, timeout=120)
+        # max_retries: the SDK waits and retries on rate limits (429) and server errors;
+        # bulk ingestion can hit rate limits, so be patient.
+        self.client = openai.OpenAI(api_key=api_key or "missing", max_retries=6, timeout=120)
         self.model = model
         self.dimensions = dimensions
         self.redis = redis
@@ -36,6 +39,7 @@ class Embedder:
                 model=self.model, input=batch, dimensions=self.dimensions
             )
             vectors.extend(item.embedding for item in response.data)
+            record(self.model, response.usage.prompt_tokens)
             if on_batch:
                 on_batch(len(vectors), len(texts))
         return vectors

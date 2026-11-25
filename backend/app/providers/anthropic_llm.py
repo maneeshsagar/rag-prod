@@ -13,6 +13,7 @@ from contextlib import contextmanager
 
 import anthropic
 
+from app.core.usage import record
 from app.providers.llm_base import ModelRefusal, ProviderUnavailable, T
 
 FALLBACK_BETA = "server-side-fallback-2026-07-01"
@@ -30,6 +31,13 @@ def _translate_errors():
         if error.status_code >= 500:  # includes 529 overloaded
             raise ProviderUnavailable(f"anthropic: {error}") from error
         raise
+
+
+def _record_usage(message) -> None:
+    usage = message.usage
+    cached = usage.cache_read_input_tokens or 0
+    total_in = usage.input_tokens + cached + (usage.cache_creation_input_tokens or 0)
+    record(message.model, total_in, usage.output_tokens, cached)
 
 
 class AnthropicLLM:
@@ -51,6 +59,7 @@ class AnthropicLLM:
                 messages=[{"role": "user", "content": user}],
                 output_format=schema,
             )
+        _record_usage(response)
         if response.stop_reason == "refusal":
             raise ModelRefusal("Claude declined this request")
         return response.parsed_output
@@ -75,6 +84,7 @@ class AnthropicLLM:
             with stream_context as stream:
                 yield from stream.text_stream
                 final = stream.get_final_message()
+        _record_usage(final)  # final.model is the fallback model if one answered
 
         if final.stop_reason == "refusal":
             raise ModelRefusal("Claude declined this request")

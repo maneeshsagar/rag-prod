@@ -21,6 +21,22 @@ ADDED_COLUMNS = [
     "ALTER TABLE ingestion_jobs ADD COLUMN IF NOT EXISTS progress VARCHAR(100)",
     "ALTER TABLE ingestion_jobs ADD COLUMN IF NOT EXISTS cancel_requested BOOLEAN DEFAULT FALSE",
     "ALTER TABLE ingestion_jobs ADD COLUMN IF NOT EXISTS worker VARCHAR(100)",
+    "ALTER TABLE ingestion_jobs ADD COLUMN IF NOT EXISTS run_after TIMESTAMP",
+    "ALTER TABLE ingestion_jobs ADD COLUMN IF NOT EXISTS started_at TIMESTAMP",
+    "ALTER TABLE ingestion_jobs ADD COLUMN IF NOT EXISTS finished_at TIMESTAMP",
+    "ALTER TABLE ingestion_jobs ADD COLUMN IF NOT EXISTS created_at TIMESTAMP DEFAULT now()",
+    "CREATE INDEX IF NOT EXISTS ix_ingestion_jobs_status ON ingestion_jobs (status)",
+    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS source_modified_at TIMESTAMP",
+    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS effective_date VARCHAR(10)",
+    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS version_label VARCHAR(20)",
+    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS is_latest BOOLEAN DEFAULT TRUE",
+    ("ALTER TABLE documents ADD COLUMN IF NOT EXISTS superseded_by_id VARCHAR(36)"
+     " REFERENCES documents(id) ON DELETE SET NULL"),
+    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS version_confidence VARCHAR(10)",
+    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS version_similarity FLOAT",
+    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS ingest_tokens INTEGER",
+    "ALTER TABLE documents ADD COLUMN IF NOT EXISTS ingest_cost_usd FLOAT",
+    "ALTER TABLE messages ADD COLUMN IF NOT EXISTS cost_usd FLOAT",
 ]
 
 

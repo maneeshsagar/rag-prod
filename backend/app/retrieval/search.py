@@ -5,8 +5,11 @@ Retrieval: question -> numbered sources for the answer model.
     2. Rerank with the cross-encoder                         -> top 6
     3. Expand context: short sections are sent whole, long ones as
        matched chunk + its neighbours, all within a hard token budget.
+
+Older versions of a document rank lower (score x weight) but are not hidden.
 """
 
+import logging
 from dataclasses import dataclass, field
 
 from sqlalchemy import select
@@ -20,6 +23,8 @@ from app.providers.embedder import get_embedder
 from app.providers.reranker import rerank
 from app.providers.sparse import sparse_query
 from app.retrieval import vector_store
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -44,6 +49,7 @@ class Source:
     text: str
     chunk_ids: list[str] = field(default_factory=list)
     score: float = 0.0
+    version_note: str | None = None  # e.g. "older version; newer: Leave Policy v3"
 
     def to_dict(self) -> dict:
         return {
@@ -54,7 +60,26 @@ class Source:
             "file_format": self.file_format,
             "section_path": self.section_path,
             "score": round(self.score, 4),
+            "version_note": self.version_note,
         }
+
+
+def version_weight(payload: dict) -> float:
+    """1.0 for the latest version; less for older versions and copies."""
+    if payload.get("is_latest", True):
+        return 1.0
+    settings = get_settings()
+    return {
+        "explicit": settings.older_version_weight_explicit,
+        "duplicate": settings.older_version_weight_duplicate,
+    }.get(payload.get("version_confidence"), settings.older_version_weight_inferred)
+
+
+def version_note(payload: dict) -> str | None:
+    if payload.get("is_latest", True):
+        return None
+    kind = "copy of" if payload.get("version_confidence") == "duplicate" else "older version; newer:"
+    return f"{kind} {payload.get('newer_version_title') or 'another document'}"
 
 
 def search_chunks(query: str, top_k: int | None = None,
@@ -72,10 +97,15 @@ def search_chunks(query: str, top_k: int | None = None,
 
     texts = [f"{p.payload['title']} — {p.payload['section_path']}\n{p.payload['text']}"
              for p in candidates]
-    scores = rerank(query, texts)
+    scores = [score * version_weight(point.payload)
+              for point, score in zip(candidates, rerank(query, texts), strict=True)]
     ranked = sorted(zip(candidates, scores, strict=True), key=lambda pair: pair[1], reverse=True)
-    return [Hit(str(point.id), score, point.payload)
-            for point, score in ranked[: top_k or settings.rerank_top_k]]
+    kept = ranked[: top_k or settings.rerank_top_k]
+
+    older = sum(1 for point, _ in kept if not point.payload.get("is_latest", True))
+    if older:
+        log.info("search kept %d older-version chunk(s) of %d (ranked lower)", older, len(kept))
+    return [Hit(str(point.id), score, point.payload) for point, score in kept]
 
 
 def _load_sections(section_ids: set[str]) -> dict[str, Section]:
@@ -149,6 +179,7 @@ def build_sources(hits: list[Hit], start_number: int = 1) -> list[Source]:
             text=text,
             chunk_ids=chunk_ids,
             score=hit.score,
+            version_note=version_note(p),
         ))
     return sources
 

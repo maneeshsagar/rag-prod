@@ -67,6 +67,13 @@ class Settings(BaseSettings):
     context_token_budget: int = 10_000  # hard cap on context sent to the answer model
     short_section_tokens: int = 1_500  # sections shorter than this are sent whole
     agent_max_searches: int = 4
+    # Older versions stay searchable but rank lower: score x weight (1.0 = no change).
+    older_version_weight_explicit: float = 0.3  # a newer version number / date exists
+    older_version_weight_inferred: float = 0.7  # only the upload order says it is older
+    older_version_weight_duplicate: float = 0.3  # an exact copy of another document
+
+    # --- Ingestion ---
+    api_ingest_worker: bool = True  # the API processes queued uploads in a background thread
 
     # --- Qdrant collection names ---
     chunks_collection: str = "chunks"  # alias -> chunks_v1
@@ -83,6 +90,8 @@ class Settings(BaseSettings):
     langfuse_public_key: str = ""
     langfuse_secret_key: str = ""
     langfuse_host: str = "https://cloud.langfuse.com"
+    langfuse_environment: str = "local"  # separates local / staging / prod traces
+    langfuse_sample_rate: float = 1.0  # share of questions traced (lower it at high traffic)
 
 
 @lru_cache
