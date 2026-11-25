@@ -542,26 +542,25 @@ rag-prod/
 
 | Phase | Weeks | Where | Deliverables | Exit criteria |
 |---|---|---|---|---|
-| **1. Core pipeline** | 1–2 | Local · 5–6 docs | docker-compose stack; Anthropic + OpenAI SDKs with fallback; OpenAI embeddings; local reranker; tiered parsing (all 5 formats); hierarchical chunking + headers; doc summary index; hybrid search + RRF + rerank; context budget; citations + verification; simple RAG + basic agentic route; chat UI (streaming, sources, history, feedback); question generator + ~20–30 reviewed questions; `make eval` | All formats ingest cleanly; lookup / table / analytical / multi-hop / unanswerable questions answered correctly with citations or properly abstained |
+| **1. Core pipeline** ✅ | 1–2 | Local · 5–6 docs | docker-compose stack; Anthropic + OpenAI SDKs with fallback; OpenAI embeddings; local reranker; tiered parsing (all 5 formats); hierarchical chunking + headers; doc summary index; hybrid search + RRF + rerank; context budget; citations + verification; simple RAG + basic agentic route; chat UI (streaming, sources, history, feedback); question generator + ~20–30 reviewed questions; `make eval` | All formats ingest cleanly; lookup / table / analytical / multi-hop / unanswerable questions answered correctly with citations or properly abstained |
 | **2. Accuracy tuning** | 3–5 | Local · 1–2k docs | Ingest 1–2k sample (resumable); golden set 200–400 Qs (drafted + reviewed); benchmark embeddings (3-large vs 3-small, dims), reranker, Claude vs GPT for generation; A/B per-chunk contextualization; dedup/versioning; router tuning; **lock chunking + models**; CI eval gate; cost per query measured | Accuracy targets met per category; models + chunking locked; cost per query known |
 | **3. Feature-complete** | 6–7 | Local | Typed field tables + extraction + SQL route (with RAG fallback); admin page; open-original-at-page; exact cache + embedding cache; rate limits; outbox + reconciliation; DLQ; provider fallback; local k6 smoke load test; security review | Every question category handled; all features working locally; eval stable |
 | **4. Move to AWS** | 8–10 | AWS | Terraform (staging + prod); security baseline; ECS, RDS, ElastiCache, S3, Qdrant, reranker container; Secrets Manager; SSO; CI/CD; full-corpus cost estimate + sign-off; **full 30k–50k ingest** (Batch APIs, parallel workers); backups + restore rehearsal; k6 at 40 QPS + outage drills | Eval on full corpus ≥ local results; SLOs met under load; restore rehearsed |
 | **5. Launch** | 11–12 | AWS production | Pilot 200 → 1,000 → 2,000 users; weekly bad-answer review; enable ACLs when needed | SLOs met; feedback acceptable; eval trend up |
 
 
-### Phase 1 status (2026-11-25, after first real run)
-- **Built and running end to end** on a real 87-page PDF (Fintech Q&A Handbook, 236 chunks) with OpenAI only (Anthropic key not set yet → automatic fallback to gpt-5 / gpt-5-mini).
-- **Baseline eval** (22 drafted questions, not yet reviewed): retrieval hit 100%, MRR 0.97, correct 95%, faithful 100%, citations supported 90%, p50 latency 14 s. The one miss (q021) is a drafted "unanswerable" question that the handbook partly answers; it is flagged for review.
-- **Live-tested:** greetings (chat route), lookups, comparisons (agentic: 3 planned searches + coverage check), follow-up rewriting, upload stages, Stop, crash recovery, switching chats while an answer streams.
-- **Fixed during review:** citation checker (citations after the full stop, plurals), answers lost when switching chats (answers now finish and save on the server), greetings answered as "not found", raw Markdown in answers, HTML tags in quotes, slow quick-steps (per-kind fallback to gpt-5-mini), repeated fallback warnings, ingests stuck as "pending" after a crash (recovered at startup).
+### Phase 1 status: ✅ DONE (2026-11-25)
+- **Running end to end with Claude** (Haiku 5.5 for quick steps, Sonnet 5.5 for answers; OpenAI fallback) on a real 87-page PDF plus one small document per format.
+- **All 5 formats verified with real answers and correct citation labels:** PDF → p. 2, DOCX → § Laptops, PPTX → slide 2 (incl. speaker notes), HTML → § Visitors (nav/footer dropped), MD → table row. Answers in 7–11 s.
+- **Baseline eval** (22 drafted questions, OpenAI-only run): retrieval hit 100%, MRR 0.97, correct 95%, faithful 100%, citations supported 90%.
+- **Live-tested:** greetings, lookups, comparisons (agentic), follow-ups, upload stages, Stop, crash recovery, switching chats mid-answer.
+- First commit: `2928945` on `main`.
 
-**Still to do before Phase 1 is closed:**
-1. Add `ANTHROPIC_API_KEY` and re-run `make eval` (Claude is the planned default; expect lower latency).
-2. Ingest the other 4–5 smoke documents, covering **DOCX, PPTX, HTML and MD** (only PDF has been tested with real files).
-3. Review `eval/golden/review.jsonl` (accept / edit / reject) and hand-add multi-hop, comparison and aggregation questions → `make eval` on reviewed questions only.
-4. Langfuse tracing (needs Langfuse keys).
-
-**Deferred:** Docling path (only if the 1–2k sample needs it), Celery workers (Phase 2), Alembic (replaces the small column-adding step in `init_db`).
+**Carried into Phase 2** (decided when closing Phase 1):
+- Review of the 22 drafted questions in `eval/golden/review.jsonl` (q021 flagged) — becomes the start of the 200–400 question golden set.
+- First `make eval` run with Claude on reviewed questions.
+- Langfuse tracing (needs Langfuse keys).
+- Deferred as planned: Docling path (only if the sample needs it), Alembic.
 
 ---
 
